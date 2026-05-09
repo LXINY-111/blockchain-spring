@@ -103,7 +103,7 @@ func (rphm *RawRelayPbftExtraHandleMod) HandleinCommit(cmsg *message.Commit) boo
 		bim := message.BlockInfoMsg{
 			BlockBodyLength: len(block.Body),
 			InnerShardTxs:   interShardTxs,
-			Epoch:           0,
+			Epoch:           int(block.Header.Number),
 
 			Relay1Txs: relay1Txs,
 			Relay2Txs: relay2Txs,

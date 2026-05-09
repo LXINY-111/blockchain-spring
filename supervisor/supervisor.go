@@ -82,6 +82,8 @@ func (d *Supervisor) NewSupervisor(ip string, pcc *params.ChainConfig, committee
 			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestCrossTxRate_Broker())
 		case "TxNumberCount_Relay":
 			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestTxNumCount_Relay())
+		case "ShardLoadVariance_Relay":
+			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestShardLoadVariance_Relay())
 		case "TxNumberCount_Broker":
 			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestTxNumCount_Broker())
 		case "Tx_Details":

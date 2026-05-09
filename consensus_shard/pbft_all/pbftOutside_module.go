@@ -76,6 +76,18 @@ func (rrom *RawRelayOutsideModule) handleInjectTx(content []byte) {
 	if err != nil {
 		log.Panic(err)
 	}
+
+	// SPRING: 先同步 address -> shard 放置表
+	for addr, sid := range it.PlacementMap {
+		rrom.pbftNode.CurChain.Update_PartitionMap(addr, sid)
+	}
+
 	rrom.pbftNode.CurChain.Txpool.AddTxs2Pool(it.Txs)
-	rrom.pbftNode.pl.Plog.Printf("S%dN%d : has handled injected txs msg, txs: %d \n", rrom.pbftNode.ShardID, rrom.pbftNode.NodeID, len(it.Txs))
+	rrom.pbftNode.pl.Plog.Printf(
+		"S%dN%d : has handled injected txs msg, txs: %d, spring placements: %d \n",
+		rrom.pbftNode.ShardID,
+		rrom.pbftNode.NodeID,
+		len(it.Txs),
+		len(it.PlacementMap),
+	)
 }

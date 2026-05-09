@@ -84,6 +84,10 @@ type SendOldMessage struct {
 type InjectTxs struct {
 	Txs       []*core.Transaction
 	ToShardID uint64
+
+	// SPRING: 本批交易中新出现地址的放置结果
+	// key = 地址，value = 分片编号
+	PlacementMap map[string]uint64
 }
 
 // data sent to the supervisor

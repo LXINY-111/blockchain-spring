@@ -22,5 +22,11 @@ var (
 	IPmap_nodeTable  = make(map[uint64]map[uint64]string)
 	CommitteeMethod  = []string{"CLPA_Broker", "CLPA", "Broker", "Relay"}
 	MeasureBrokerMod = []string{"TPS_Broker", "TCL_Broker", "CrossTxRate_Broker", "TxNumberCount_Broker"}
-	MeasureRelayMod  = []string{"TPS_Relay", "TCL_Relay", "CrossTxRate_Relay", "TxNumberCount_Relay"}
+	MeasureRelayMod  = []string{
+		"TPS_Relay",
+		"TCL_Relay",
+		"CrossTxRate_Relay",
+		"TxNumberCount_Relay",
+		"ShardLoadVariance_Relay",
+	}
 )
