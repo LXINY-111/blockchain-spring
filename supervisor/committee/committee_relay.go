@@ -42,6 +42,9 @@ type RelayCommitteeModule struct {
 	// SPRING: 保存最近若干个块的每分片交易数和跨片交易数
 	// 后续 PPO 状态向量要用
 	springStats map[uint64][]SpringBlockStat
+
+	// SPRING: 新地址放置动作编号，用于生成 action_1.json、action_2.json
+	springActionSeq uint64
 }
 
 func NewRelayCommitteeModule(Ip_nodeTable map[uint64]map[uint64]string, Ss *signal.StopSignal, slog *supervisor_log.SupervisorLog, csvFilePath string, dataNum, batchNum int) *RelayCommitteeModule {
@@ -80,7 +83,7 @@ func data2tx(data []string, nonce uint64) (*core.Transaction, bool) {
 
 func (rthm *RelayCommitteeModule) HandleOtherMessage([]byte) {}
 
-// SPRING: 判断地址是否已经被放置；如果没有，就给它分片
+// SPRING: 判断地址是否已经被放置；如果没有，就根据 SpringMode 给它分片
 func (rthm *RelayCommitteeModule) springEnsurePlaced(
 	addr utils.Address,
 	related utils.Address,
@@ -90,14 +93,29 @@ func (rthm *RelayCommitteeModule) springEnsurePlaced(
 		return sid
 	}
 
-	sid := rthm.springChooseShardPPO(addr, related)
+	var sid uint64
+
+	switch params.SpringMode {
+	case 1:
+		// SPRING-Heuristic：只使用 Go 里的启发式规则，不调用 Python
+		sid = rthm.springChooseShard(addr, related)
+
+	case 2:
+		// SPRING-PPO：调用 Python PPO；如果 Python 失败，springChooseShardPPO 内部会自动回退到启发式
+		sid = rthm.springChooseShardPPO(addr, related)
+
+	default:
+		// SpringMode = 0 或其他非法值：退化为原始 Hash 放置
+		sid = uint64(utils.Addr2Shard(addr))
+	}
 
 	rthm.springAddrShard[string(addr)] = sid
 	rthm.springShardLoad[sid]++
 	batchPlacement[string(addr)] = sid
 
 	rthm.sl.Slog.Printf(
-		"[SPRING PLACE] addr=%s shard=%d related=%s totalPlaced=%d\n",
+		"[SPRING PLACE] mode=%d addr=%s shard=%d related=%s totalPlaced=%d\n",
+		params.SpringMode,
 		addr,
 		sid,
 		related,
@@ -173,8 +191,16 @@ func (rthm *RelayCommitteeModule) springPreparePlacement(
 }
 
 func (rthm *RelayCommitteeModule) txSending(txlist []*core.Transaction) {
-	// SPRING: 先为本批交易里第一次出现的地址做放置
-	batchPlacement := rthm.springPreparePlacement(txlist)
+	useSpringPlacement := params.SpringMode != 0
+
+	batchPlacement := make(map[string]uint64)
+
+	// SpringMode = 1 或 2 时，才进行 SPRING 新地址放置
+	// SpringMode = 0 时，直接走原始 Hash Relay
+	if useSpringPlacement {
+		batchPlacement = rthm.springPreparePlacement(txlist)
+	}
+
 	// the txs will be sent
 	sendToShard := make(map[uint64][]*core.Transaction)
 
@@ -183,25 +209,47 @@ func (rthm *RelayCommitteeModule) txSending(txlist []*core.Transaction) {
 			// send to shard
 			for sid := uint64(0); sid < uint64(params.ShardNum); sid++ {
 				it := message.InjectTxs{
-					Txs:          sendToShard[sid],
-					ToShardID:    sid,
-					PlacementMap: batchPlacement,
+					Txs:       sendToShard[sid],
+					ToShardID: sid,
 				}
+
+				// 只有 SPRING-Heuristic / SPRING-PPO 才需要同步放置表
+				// 原始 Hash Relay 不需要 PlacementMap
+				if useSpringPlacement {
+					it.PlacementMap = batchPlacement
+				}
+
 				itByte, err := json.Marshal(it)
 				if err != nil {
 					log.Panic(err)
 				}
-				send_msg := message.MergeMessage(message.CInject, itByte)
-				go networks.TcpDial(send_msg, rthm.IpNodeTable[sid][0])
+
+				sendMsg := message.MergeMessage(message.CInject, itByte)
+				go networks.TcpDial(sendMsg, rthm.IpNodeTable[sid][0])
 			}
+
 			sendToShard = make(map[uint64][]*core.Transaction)
 			time.Sleep(time.Second)
 		}
+
 		if idx == len(txlist) {
 			break
 		}
+
 		tx := txlist[idx]
-		sendersid := rthm.springAddrShard[string(tx.Sender)]
+
+		var sendersid uint64
+
+		if useSpringPlacement {
+			// SPRING-Heuristic / SPRING-PPO：
+			// 交易发送到 sender 在 SPRING 放置表中的分片
+			sendersid = rthm.springAddrShard[string(tx.Sender)]
+		} else {
+			// 原始 Hash Relay：
+			// 交易发送到 sender 哈希映射得到的分片
+			sendersid = uint64(utils.Addr2Shard(tx.Sender))
+		}
+
 		sendToShard[sendersid] = append(sendToShard[sendersid], tx)
 	}
 }

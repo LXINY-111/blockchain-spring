@@ -33,6 +33,12 @@ var (
 	BrokerNum            = 10 // The # of Broker accounts used in Broker / CLPA_Broker.
 	RelayWithMerkleProof = 0  // When using a consensus about "Relay", nodes will send Tx Relay with proof if "RelayWithMerkleProof" = 1
 
+	// SPRING mode:
+	// 0 = 原始 Hash Relay
+	// 1 = SPRING-Heuristic
+	// 2 = SPRING-PPO
+	SpringMode = 2
+
 	ExpDataRootDir     = "expTest"                     // The root dir where the experimental data should locate.
 	DataWrite_path     = ExpDataRootDir + "/result/"   // Measurement data result output path
 	LogWrite_path      = ExpDataRootDir + "/log"       // Log output path
@@ -54,6 +60,8 @@ var (
 // read from file
 type globalConfig struct {
 	ConsensusMethod int `json:"ConsensusMethod"`
+
+	SpringMode int `json:"SpringMode"`
 
 	PbftViewChangeTimeOut int `json:"PbftViewChangeTimeOut"`
 
@@ -97,6 +105,8 @@ func ReadConfigFile() {
 	// set configurations to params
 	// consensus params
 	ConsensusMethod = config.ConsensusMethod
+
+	SpringMode = config.SpringMode
 
 	PbftViewChangeTimeOut = config.PbftViewChangeTimeOut
 

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,7 +91,8 @@ func (rthm *RelayCommitteeModule) springCallPython(addr string, related string, 
 		return 0, "mkdir_failed", false
 	}
 
-	reqID := time.Now().UnixNano()
+	reqID := atomic.AddUint64(&rthm.springActionSeq, 1)
+
 	inputPath := filepath.Join("spring_io", fmt.Sprintf("state_%d.json", reqID))
 	outputPath := filepath.Join("spring_io", fmt.Sprintf("action_%d.json", reqID))
 
