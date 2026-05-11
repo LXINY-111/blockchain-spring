@@ -130,7 +130,9 @@ func (p *PbftConsensusNode) RelayMsgSend() {
 			log.Panic()
 		}
 		msg_send := message.MergeMessage(message.CRelay, rByte)
-		go networks.TcpDial(msg_send, p.ip_nodeTable[sid][0])
+		for _, ip := range p.ip_nodeTable[sid] {
+			go networks.TcpDial(msg_send, ip)
+		}
 		p.pl.Plog.Printf("S%dN%d : sended relay txs to %d\n", p.ShardID, p.NodeID, sid)
 	}
 	p.CurChain.Txpool.ClearRelayPool()
@@ -164,7 +166,9 @@ func (p *PbftConsensusNode) RelayWithProofSend(block *core.Block) {
 		}
 		msg_send := message.MergeMessage(message.CRelayWithProof, rByte)
 
-		go networks.TcpDial(msg_send, p.ip_nodeTable[sid][0])
+		for _, ip := range p.ip_nodeTable[sid] {
+			go networks.TcpDial(msg_send, ip)
+		}
 		p.pl.Plog.Printf("S%dN%d : sended relay txs & proofs to %d\n", p.ShardID, p.NodeID, sid)
 	}
 	p.CurChain.Txpool.ClearRelayPool()

@@ -90,4 +90,12 @@ func (rrom *RawRelayOutsideModule) handleInjectTx(content []byte) {
 		len(it.Txs),
 		len(it.PlacementMap),
 	)
+
+	log.Printf(
+		"[SHARD INJECT] shard=%d node=%d txs=%d placements=%d\n",
+		rrom.pbftNode.ShardID,
+		rrom.pbftNode.NodeID,
+		len(it.Txs),
+		len(it.PlacementMap),
+	)
 }

@@ -349,6 +349,21 @@ func (rthm *RelayCommitteeModule) txSending(txlist []*core.Transaction) {
 
 	for idx := 0; idx <= len(txlist); idx++ {
 		if idx > 0 && (idx%params.InjectSpeed == 0 || idx == len(txlist)) {
+			if useSpringPlacement {
+				counts := make([]int, params.ShardNum)
+				for sid := uint64(0); sid < uint64(params.ShardNum); sid++ {
+					counts[sid] = len(sendToShard[sid])
+				}
+
+				rthm.sl.Slog.Printf(
+					"[SPRING SEND] nowData=%d txlistLen=%d idx=%d counts=%v placementSize=%d\n",
+					rthm.nowDataNum,
+					len(txlist),
+					idx,
+					counts,
+					len(batchPlacement),
+				)
+			}
 			// send to shard
 			for sid := uint64(0); sid < uint64(params.ShardNum); sid++ {
 				it := message.InjectTxs{
@@ -368,7 +383,9 @@ func (rthm *RelayCommitteeModule) txSending(txlist []*core.Transaction) {
 				}
 
 				sendMsg := message.MergeMessage(message.CInject, itByte)
-				go networks.TcpDial(sendMsg, rthm.IpNodeTable[sid][0])
+				for _, ip := range rthm.IpNodeTable[sid] {
+					go networks.TcpDial(sendMsg, ip)
+				}
 			}
 
 			sendToShard = make(map[uint64][]*core.Transaction)
@@ -435,7 +452,15 @@ func (rthm *RelayCommitteeModule) MsgSendingControl() {
 }
 
 func (rthm *RelayCommitteeModule) HandleBlockInfo(b *message.BlockInfoMsg) {
-	rthm.sl.Slog.Printf("received from shard %d in epoch %d.\n", b.SenderShardID, b.Epoch)
+	rthm.sl.Slog.Printf(
+		"[BLOCK INFO] shard=%d epoch=%d body=%d inner=%d relay1=%d relay2=%d\n",
+		b.SenderShardID,
+		b.Epoch,
+		b.BlockBodyLength,
+		len(b.InnerShardTxs),
+		len(b.Relay1Txs),
+		len(b.Relay2Txs),
+	)
 
 	if b.BlockBodyLength == 0 {
 		return

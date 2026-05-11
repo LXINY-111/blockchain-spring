@@ -1,9 +1,9 @@
 {
   "ConsensusMethod": 3,
 
-  "SpringMode": 2,
+  "SpringMode": 1,
   
-  "PbftViewChangeTimeOut":20000,
+  "PbftViewChangeTimeOut":600000,
 
   "ExpDataRootDir": "expTest",
 
@@ -13,9 +13,9 @@
   "BlocksizeInBytes": 200000,
   "UseBlocksizeInBytes": 0,
 
-  "InjectSpeed": 50,
-  "TotalDataSize": 200,
-  "TxBatchSize": 50,
+  "InjectSpeed": 100,
+  "TotalDataSize": 2000,
+  "TxBatchSize": 100,
 
   "BrokerNum": 10,
   "RelayWithMerkleProof": 0,
