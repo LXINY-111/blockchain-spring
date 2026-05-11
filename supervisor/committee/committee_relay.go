@@ -179,15 +179,158 @@ func (rthm *RelayCommitteeModule) springPreparePlacement(
 
 	batchPlacement := make(map[string]uint64)
 
-	for _, tx := range txlist {
-		// 如果 sender 是第一次出现，优先参考 recipient 的已有分片
-		rthm.springEnsurePlaced(tx.Sender, tx.Recipient, batchPlacement)
+	switch params.SpringMode {
+	case 0:
+		// 原始 Hash Relay，不做 SPRING 放置。
+		return batchPlacement
 
-		// 如果 recipient 是第一次出现，优先参考 sender 的已有分片
-		rthm.springEnsurePlaced(tx.Recipient, tx.Sender, batchPlacement)
+	case 1:
+		for _, tx := range txlist {
+			rthm.springEnsurePlaced(tx.Sender, tx.Recipient, batchPlacement)
+			rthm.springEnsurePlaced(tx.Recipient, tx.Sender, batchPlacement)
+		}
+		rthm.springFillTouchedPlacement(txlist, batchPlacement)
+		return batchPlacement
+
+	case 2:
+		rthm.springPreparePlacementPPOBatch(txlist, batchPlacement)
+		rthm.springFillTouchedPlacement(txlist, batchPlacement)
+		return batchPlacement
+
+	default:
+		// 非法模式兜底：当作 Hash 放置，但仍同步 PlacementMap，避免空映射导致异常。
+		for _, tx := range txlist {
+			rthm.springEnsurePlaced(tx.Sender, tx.Recipient, batchPlacement)
+			rthm.springEnsurePlaced(tx.Recipient, tx.Sender, batchPlacement)
+		}
+		return batchPlacement
+	}
+}
+
+func (rthm *RelayCommitteeModule) springFillTouchedPlacement(
+	txlist []*core.Transaction,
+	batchPlacement map[string]uint64,
+) {
+	for _, tx := range txlist {
+		if sid, ok := rthm.springAddrShard[string(tx.Sender)]; ok {
+			batchPlacement[string(tx.Sender)] = sid
+		}
+
+		if sid, ok := rthm.springAddrShard[string(tx.Recipient)]; ok {
+			batchPlacement[string(tx.Recipient)] = sid
+		}
+	}
+}
+
+func (rthm *RelayCommitteeModule) springPreparePlacementPPOBatch(
+	txlist []*core.Transaction,
+	batchPlacement map[string]uint64,
+) {
+	pending := make([]SpringBatchInferItem, 0)
+	seenInBatch := make(map[string]bool)
+
+	addPending := func(addr utils.Address, related utils.Address) {
+		key := string(addr)
+
+		if key == "" {
+			return
+		}
+
+		if _, ok := rthm.springAddrShard[key]; ok {
+			return
+		}
+
+		if seenInBatch[key] {
+			return
+		}
+
+		state := rthm.springBuildState(related)
+
+		pending = append(pending, SpringBatchInferItem{
+			Address: key,
+			Related: string(related),
+			State:   state,
+		})
+
+		seenInBatch[key] = true
 	}
 
-	return batchPlacement
+	for _, tx := range txlist {
+		addPending(tx.Sender, tx.Recipient)
+		addPending(tx.Recipient, tx.Sender)
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	results, inferCostUs, ok := rthm.springCallPythonBatch(pending)
+
+	resultByAddr := make(map[string]SpringBatchInferResult)
+	if ok {
+		for _, result := range results {
+			resultByAddr[result.Address] = result
+		}
+	}
+
+	perItemCostUs := inferCostUs
+	if len(pending) > 0 {
+		perItemCostUs = inferCostUs / int64(len(pending))
+	}
+
+	for _, item := range pending {
+		addr := utils.Address(item.Address)
+		related := utils.Address(item.Related)
+
+		var sid uint64
+		source := ""
+		confidence := 0.0
+
+		result, hasResult := resultByAddr[item.Address]
+		if ok && hasResult && result.Shard >= 0 && result.Shard < params.ShardNum {
+			sid = uint64(result.Shard)
+			source = result.Source
+			confidence = result.Confidence
+
+			if source == "" {
+				source = "python_ppo"
+			}
+		} else {
+			sid = rthm.springChooseShard(addr, related)
+			source = "go_heuristic_batch_fallback"
+			confidence = 0.0
+		}
+
+		if _, exists := rthm.springAddrShard[item.Address]; exists {
+			continue
+		}
+
+		rthm.springAddrShard[item.Address] = sid
+		rthm.springShardLoad[sid]++
+		batchPlacement[item.Address] = sid
+
+		rthm.springAppendDecisionRecord(
+			item.Address,
+			item.Related,
+			sid,
+			source,
+			confidence,
+			item.State,
+			perItemCostUs,
+			len(pending),
+		)
+
+		rthm.sl.Slog.Printf(
+			"[SPRING PPO BATCH PLACE] mode=%d addr=%s shard=%d related=%s source=%s confidence=%.6f totalPlaced=%d\n",
+			params.SpringMode,
+			item.Address,
+			sid,
+			item.Related,
+			source,
+			confidence,
+			len(rthm.springAddrShard),
+		)
+	}
 }
 
 func (rthm *RelayCommitteeModule) txSending(txlist []*core.Transaction) {

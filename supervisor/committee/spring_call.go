@@ -13,17 +13,27 @@ import (
 	"time"
 )
 
-type SpringInferInput struct {
+type SpringBatchInferItem struct {
 	Address string    `json:"address"`
 	Related string    `json:"related"`
 	State   []float64 `json:"state"`
-	Shards  int       `json:"shards"`
 }
 
-type SpringInferOutput struct {
+type SpringBatchInferInput struct {
+	Shards int                    `json:"shards"`
+	Items  []SpringBatchInferItem `json:"items"`
+}
+
+type SpringBatchInferResult struct {
+	Address    string  `json:"address"`
+	Related    string  `json:"related"`
 	Shard      int     `json:"shard"`
 	Source     string  `json:"source"`
 	Confidence float64 `json:"confidence"`
+}
+
+type SpringBatchInferOutput struct {
+	Items []SpringBatchInferResult `json:"items"`
 }
 
 type SpringDecisionRecord struct {
@@ -32,86 +42,111 @@ type SpringDecisionRecord struct {
 	Related      string    `json:"related"`
 	Shard        uint64    `json:"shard"`
 	Source       string    `json:"source"`
+	Confidence   float64   `json:"confidence"`
 	StateDim     int       `json:"state_dim"`
 	InferCostUs  int64     `json:"infer_cost_us"`
+	BatchSize    int       `json:"batch_size"`
 	State        []float64 `json:"state"`
 }
 
-// springChooseShardPPO 是版本 3 的入口。
-// 你原来的 springChooseShard(addr, related) 仍然保留，作为启发式兜底。
+// springChooseShardPPO 保留为单地址调试入口。
+// 正式 TxBatch 运行时会走 springCallPythonBatch。
 func (rthm *RelayCommitteeModule) springChooseShardPPO(addr utils.Address, related utils.Address) uint64 {
 	state := rthm.springBuildState(related)
 
-	start := time.Now()
-	sid, source, ok := rthm.springCallPython(string(addr), string(related), state)
-	inferCostUs := time.Since(start).Microseconds()
-
-	if ok {
-		rthm.springAppendDecisionRecord(string(addr), string(related), sid, source, state, inferCostUs)
-		rthm.sl.Slog.Printf(
-			"[SPRING PPO] addr=%s related=%s shard=%d source=%s cost_us=%d\n",
-			addr,
-			related,
-			sid,
-			source,
-			inferCostUs,
-		)
-		return sid
+	items := []SpringBatchInferItem{
+		{
+			Address: string(addr),
+			Related: string(related),
+			State:   state,
+		},
 	}
 
-	// Python 推理失败时，退回版本 1 的启发式策略。
+	results, inferCostUs, ok := rthm.springCallPythonBatch(items)
+	if ok && len(results) == 1 {
+		output := results[0]
+		if output.Shard >= 0 && output.Shard < params.ShardNum {
+			sid := uint64(output.Shard)
+			source := output.Source
+			if source == "" {
+				source = "python_ppo"
+			}
+
+			rthm.springAppendDecisionRecord(
+				string(addr),
+				string(related),
+				sid,
+				source,
+				output.Confidence,
+				state,
+				inferCostUs,
+				1,
+			)
+
+			rthm.sl.Slog.Printf(
+				"[SPRING PPO] addr=%s related=%s shard=%d source=%s confidence=%.6f cost_us=%d\n",
+				addr, related, sid, source, output.Confidence, inferCostUs,
+			)
+			return sid
+		}
+	}
+
 	fallbackSid := rthm.springChooseShard(addr, related)
+
 	rthm.springAppendDecisionRecord(
 		string(addr),
 		string(related),
 		fallbackSid,
 		"go_heuristic_fallback",
+		0.0,
 		state,
 		inferCostUs,
+		1,
 	)
 
 	rthm.sl.Slog.Printf(
 		"[SPRING PPO FALLBACK] addr=%s related=%s shard=%d cost_us=%d\n",
-		addr,
-		related,
-		fallbackSid,
-		inferCostUs,
+		addr, related, fallbackSid, inferCostUs,
 	)
 
 	return fallbackSid
 }
 
-func (rthm *RelayCommitteeModule) springCallPython(addr string, related string, state []float64) (uint64, string, bool) {
-	if len(state) == 0 {
-		return 0, "empty_state", false
+func (rthm *RelayCommitteeModule) springCallPythonBatch(items []SpringBatchInferItem) ([]SpringBatchInferResult, int64, bool) {
+	if len(items) == 0 {
+		return []SpringBatchInferResult{}, 0, true
+	}
+
+	for _, item := range items {
+		if len(item.State) == 0 {
+			return nil, 0, false
+		}
 	}
 
 	if err := os.MkdirAll("spring_io", os.ModePerm); err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO] mkdir spring_io failed: %v\n", err)
-		return 0, "mkdir_failed", false
+		rthm.sl.Slog.Printf("[SPRING PPO BATCH] mkdir spring_io failed: %v\n", err)
+		return nil, 0, false
 	}
 
 	reqID := atomic.AddUint64(&rthm.springActionSeq, 1)
 
-	inputPath := filepath.Join("spring_io", fmt.Sprintf("state_%d.json", reqID))
-	outputPath := filepath.Join("spring_io", fmt.Sprintf("action_%d.json", reqID))
+	inputPath := filepath.Join("spring_io", fmt.Sprintf("batch_state_%d.json", reqID))
+	outputPath := filepath.Join("spring_io", fmt.Sprintf("batch_action_%d.json", reqID))
 
-	input := SpringInferInput{
-		Address: addr,
-		Related: related,
-		State:   state,
-		Shards:  params.ShardNum,
+	input := SpringBatchInferInput{
+		Shards: params.ShardNum,
+		Items:  items,
 	}
 
 	inputBytes, err := json.Marshal(input)
 	if err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO] marshal input failed: %v\n", err)
-		return 0, "marshal_failed", false
+		rthm.sl.Slog.Printf("[SPRING PPO BATCH] marshal input failed: %v\n", err)
+		return nil, 0, false
 	}
 
 	if err := os.WriteFile(inputPath, inputBytes, 0644); err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO] write input failed: %v\n", err)
-		return 0, "write_input_failed", false
+		rthm.sl.Slog.Printf("[SPRING PPO BATCH] write input failed: %v\n", err)
+		return nil, 0, false
 	}
 
 	pythonCmd := os.Getenv("SPRING_PYTHON")
@@ -123,9 +158,11 @@ func (rthm *RelayCommitteeModule) springCallPython(addr string, related string, 
 		}
 	}
 
+	start := time.Now()
+
 	cmd := exec.Command(
 		pythonCmd,
-		"spring_lite/infer.py",
+		filepath.Join("spring_lite", "infer_batch.py"),
 		"--state",
 		inputPath,
 		"--out",
@@ -133,34 +170,42 @@ func (rthm *RelayCommitteeModule) springCallPython(addr string, related string, 
 	)
 
 	out, err := cmd.CombinedOutput()
+	inferCostUs := time.Since(start).Microseconds()
+
 	if err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO] python infer failed: %v, output=%s\n", err, string(out))
-		return 0, "python_failed", false
+		rthm.sl.Slog.Printf(
+			"[SPRING PPO BATCH] python infer failed: %v, output=%s\n",
+			err,
+			string(out),
+		)
+		return nil, inferCostUs, false
 	}
 
 	outputBytes, err := os.ReadFile(outputPath)
 	if err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO] read output failed: %v\n", err)
-		return 0, "read_output_failed", false
+		rthm.sl.Slog.Printf("[SPRING PPO BATCH] read output failed: %v\n", err)
+		return nil, inferCostUs, false
 	}
 
-	var output SpringInferOutput
+	var output SpringBatchInferOutput
 	if err := json.Unmarshal(outputBytes, &output); err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO] unmarshal output failed: %v, raw=%s\n", err, string(outputBytes))
-		return 0, "unmarshal_output_failed", false
+		rthm.sl.Slog.Printf(
+			"[SPRING PPO BATCH] unmarshal output failed: %v, raw=%s\n",
+			err,
+			string(outputBytes),
+		)
+		return nil, inferCostUs, false
 	}
 
-	if output.Shard < 0 || output.Shard >= params.ShardNum {
-		rthm.sl.Slog.Printf("[SPRING PPO] invalid shard=%d\n", output.Shard)
-		return 0, "invalid_shard", false
-	}
+	rthm.sl.Slog.Printf(
+		"[SPRING PPO BATCH] batch_id=%d items=%d results=%d cost_us=%d\n",
+		reqID,
+		len(items),
+		len(output.Items),
+		inferCostUs,
+	)
 
-	source := output.Source
-	if source == "" {
-		source = "python_ppo"
-	}
-
-	return uint64(output.Shard), source, true
+	return output.Items, inferCostUs, true
 }
 
 func (rthm *RelayCommitteeModule) springAppendDecisionRecord(
@@ -168,8 +213,10 @@ func (rthm *RelayCommitteeModule) springAppendDecisionRecord(
 	related string,
 	shard uint64,
 	source string,
+	confidence float64,
 	state []float64,
 	inferCostUs int64,
+	batchSize int,
 ) {
 	if err := os.MkdirAll("spring_io", os.ModePerm); err != nil {
 		return
@@ -181,8 +228,10 @@ func (rthm *RelayCommitteeModule) springAppendDecisionRecord(
 		Related:      related,
 		Shard:        shard,
 		Source:       source,
+		Confidence:   confidence,
 		StateDim:     len(state),
 		InferCostUs:  inferCostUs,
+		BatchSize:    batchSize,
 		State:        state,
 	}
 
