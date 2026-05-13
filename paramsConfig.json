@@ -1,7 +1,7 @@
 {
   "ConsensusMethod": 3,
 
-  "SpringMode": 1,
+  "SpringMode": 2,
   
   "PbftViewChangeTimeOut":600000,
 
@@ -14,7 +14,7 @@
   "UseBlocksizeInBytes": 0,
 
   "InjectSpeed": 100,
-  "TotalDataSize": 2000,
+  "TotalDataSize": 200,
   "TxBatchSize": 100,
 
   "BrokerNum": 10,

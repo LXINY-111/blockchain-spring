@@ -20,8 +20,11 @@ import (
 )
 
 type SpringBlockStat struct {
-	NumTx   int
-	CrossTx int
+	NumTx    int `json:"num_tx"`
+	InnerTx  int `json:"inner_tx"`
+	Relay1Tx int `json:"relay1_tx"`
+	Relay2Tx int `json:"relay2_tx"`
+	CrossTx  int `json:"cross_tx"`
 }
 
 type RelayCommitteeModule struct {
@@ -43,6 +46,13 @@ type RelayCommitteeModule struct {
 	// 后续 PPO 状态向量要用
 	springStats map[uint64][]SpringBlockStat
 
+	// SPRING 在线训练第一步：按 epoch 收集真实区块反馈，用于计算 reward
+	springEpochFeedback map[int]map[uint64]SpringBlockStat
+	springRewardedEpoch map[int]bool
+
+	// SPRING 在线训练：等待和真实区块 reward 匹配的 PPO 动作批次
+	springPendingTrainBatches []SpringTrainBatch
+
 	// SPRING: 新地址放置动作编号，用于生成 action_1.json、action_2.json
 	springActionSeq uint64
 }
@@ -61,9 +71,11 @@ func NewRelayCommitteeModule(Ip_nodeTable map[uint64]map[uint64]string, Ss *sign
 		Ss:           Ss,
 		sl:           slog,
 
-		springAddrShard: make(map[string]uint64),
-		springShardLoad: make([]int, params.ShardNum),
-		springStats:     springStats,
+		springAddrShard:     make(map[string]uint64),
+		springShardLoad:     make([]int, params.ShardNum),
+		springStats:         springStats,
+		springEpochFeedback: make(map[int]map[uint64]SpringBlockStat),
+		springRewardedEpoch: make(map[int]bool),
 	}
 }
 
@@ -278,6 +290,10 @@ func (rthm *RelayCommitteeModule) springPreparePlacementPPOBatch(
 		perItemCostUs = inferCostUs / int64(len(pending))
 	}
 
+	// 关键：一个 TxBatch 只维护一个 trainActions。
+	// for 循环里只 append，循环结束后统一入队一次。
+	trainActions := make([]SpringTrainAction, 0, len(pending))
+
 	for _, item := range pending {
 		addr := utils.Address(item.Address)
 		related := utils.Address(item.Related)
@@ -287,6 +303,7 @@ func (rthm *RelayCommitteeModule) springPreparePlacementPPOBatch(
 		confidence := 0.0
 
 		result, hasResult := resultByAddr[item.Address]
+
 		if ok && hasResult && result.Shard >= 0 && result.Shard < params.ShardNum {
 			sid = uint64(result.Shard)
 			source = result.Source
@@ -310,15 +327,30 @@ func (rthm *RelayCommitteeModule) springPreparePlacementPPOBatch(
 		batchPlacement[item.Address] = sid
 
 		rthm.springAppendDecisionRecord(
+			result.BatchID,
 			item.Address,
 			item.Related,
 			sid,
 			source,
 			confidence,
+			result.LogProb,
+			result.Value,
 			item.State,
 			perItemCostUs,
 			len(pending),
 		)
+
+		if source == "python_ppo" && result.BatchID > 0 {
+			trainActions = append(trainActions, SpringTrainAction{
+				BatchID: result.BatchID,
+				Address: item.Address,
+				Related: item.Related,
+				State:   item.State,
+				Action:  int(sid),
+				LogProb: result.LogProb,
+				Value:   result.Value,
+			})
+		}
 
 		rthm.sl.Slog.Printf(
 			"[SPRING PPO BATCH PLACE] mode=%d addr=%s shard=%d related=%s source=%s confidence=%.6f totalPlaced=%d\n",
@@ -330,6 +362,13 @@ func (rthm *RelayCommitteeModule) springPreparePlacementPPOBatch(
 			confidence,
 			len(rthm.springAddrShard),
 		)
+	}
+
+	// 关键修复：
+	// 必须放在 for 循环外面。
+	// 一个 PPO batch 只入队一次。
+	if len(trainActions) > 0 {
+		rthm.springEnqueueTrainActionsLocked(trainActions[0].BatchID, trainActions)
 	}
 }
 
@@ -462,26 +501,82 @@ func (rthm *RelayCommitteeModule) HandleBlockInfo(b *message.BlockInfoMsg) {
 		len(b.Relay2Txs),
 	)
 
-	if b.BlockBodyLength == 0 {
-		return
-	}
-
 	rthm.springLock.Lock()
 	defer rthm.springLock.Unlock()
 
+	// 注意：
+	// 1. CrossTx 第一版只用 Relay1Tx。
+	// 2. Relay2Tx 是跨片交易第二阶段，不要和 Relay1 一起重复计入 crossRate。
 	stat := SpringBlockStat{
-		NumTx:   b.BlockBodyLength,
-		CrossTx: len(b.Relay1Txs) + len(b.Relay2Txs),
+		NumTx:    b.BlockBodyLength,
+		InnerTx:  len(b.InnerShardTxs),
+		Relay1Tx: len(b.Relay1Txs),
+		Relay2Tx: len(b.Relay2Txs),
+		CrossTx:  len(b.Relay1Txs),
 	}
 
+	// 更新最近 5 个区块窗口，供 springBuildState() 继续使用。
+	// 这里不再跳过 body=0 的空块，因为空块也代表该 shard 当前负载为 0。
 	arr := rthm.springStats[b.SenderShardID]
 	arr = append(arr, stat)
-
 	if len(arr) > 5 {
 		arr = arr[len(arr)-5:]
 	}
-
 	rthm.springStats[b.SenderShardID] = arr
+
+	// 按 epoch 收集所有 shard 的真实反馈。
+	if _, ok := rthm.springEpochFeedback[b.Epoch]; !ok {
+		rthm.springEpochFeedback[b.Epoch] = make(map[uint64]SpringBlockStat)
+	}
+	rthm.springEpochFeedback[b.Epoch][b.SenderShardID] = stat
+
+	// 收齐一个 epoch 的所有 shard 反馈后，计算一次 reward。
+	if len(rthm.springEpochFeedback[b.Epoch]) == params.ShardNum && !rthm.springRewardedEpoch[b.Epoch] {
+		record, ok := rthm.springBuildFeedbackRewardRecord(b.Epoch, rthm.springEpochFeedback[b.Epoch])
+		if ok {
+			rthm.springAppendFeedbackRecord(record)
+
+			rthm.sl.Slog.Printf(
+				"[SPRING ONLINE REWARD] epoch=%d total=%d inner=%d relay1=%d relay2=%d crossRate=%.6f normVar=%.6f reward=%.6f loads=%v\n",
+				record.Epoch,
+				record.TotalTx,
+				record.TotalInner,
+				record.TotalRelay1,
+				record.TotalRelay2,
+				record.CrossRate,
+				record.NormalizedLoadVariance,
+				record.Reward,
+				record.Loads,
+			)
+
+			onlineInput, updateOk := rthm.springBuildOnlineUpdateInputLocked(record)
+			if updateOk {
+				rthm.springWriteOnlineUpdateInput(onlineInput)
+
+				// 第四步：生成 online_update 文件后，立即调用 Python 更新 PPO。
+				// 这里不做显式负载保护，也不改 PPO 动作，只用 reward 训练模型。
+				rthm.springCallPythonOnlineUpdate(onlineInput)
+			}
+		} else {
+			rthm.sl.Slog.Printf(
+				"[SPRING ONLINE REWARD SKIP] epoch=%d reason=empty_or_relay2_only\n",
+				b.Epoch,
+			)
+		}
+		rthm.springRewardedEpoch[b.Epoch] = true
+
+		// 简单清理旧 epoch，避免长时间运行 map 越来越大。
+		for oldEpoch := range rthm.springEpochFeedback {
+			if oldEpoch < b.Epoch-10 {
+				delete(rthm.springEpochFeedback, oldEpoch)
+			}
+		}
+		for oldEpoch := range rthm.springRewardedEpoch {
+			if oldEpoch < b.Epoch-10 {
+				delete(rthm.springRewardedEpoch, oldEpoch)
+			}
+		}
+	}
 }
 
 func (rthm *RelayCommitteeModule) springGetStat(sid uint64, back int) SpringBlockStat {
