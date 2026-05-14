@@ -49,8 +49,15 @@ type SpringTrainAction struct {
 	Action  int       `json:"action"`
 	LogProb float64   `json:"log_prob"`
 	Value   float64   `json:"value"`
-	Reward  float64   `json:"reward"`
-	Done    bool      `json:"done"`
+
+	Reward float64 `json:"reward"`
+	Done   bool    `json:"done"`
+
+	RelatedKnown          bool `json:"related_known"`
+	RelatedShard          int  `json:"related_shard"`
+	ChosenShard           int  `json:"chosen_shard"`
+	SameAsRelated         bool `json:"same_as_related"`
+	RelatedInCurrentBatch bool `json:"related_in_current_batch"`
 }
 
 type SpringTrainBatch struct {

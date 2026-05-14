@@ -575,6 +575,36 @@ func (rthm *RelayCommitteeModule) springGetStat(sid uint64, back int) SpringBloc
 	return arr[idx]
 }
 
+func springNormalizeStateCount(v int) float64 {
+	denom := float64(params.TxBatchSize)
+	if denom <= 0 {
+		denom = 100.0
+	}
+
+	x := float64(v) / denom
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+func springExtractRelatedShardFromState(state []float64) (bool, int) {
+	base := len(state) - 1 - params.ShardNum
+	if base < 0 {
+		return false, -1
+	}
+
+	for sid := 0; sid < params.ShardNum; sid++ {
+		if state[base+sid] > 0.5 {
+			return true, sid
+		}
+	}
+	return false, -1
+}
+
 func (rthm *RelayCommitteeModule) springBuildState(related utils.Address) []float64 {
 	state := make([]float64, 0, 11*params.ShardNum+1)
 
@@ -582,7 +612,7 @@ func (rthm *RelayCommitteeModule) springBuildState(related utils.Address) []floa
 	for back := 4; back >= 0; back-- {
 		for sid := uint64(0); sid < uint64(params.ShardNum); sid++ {
 			st := rthm.springGetStat(sid, back)
-			state = append(state, float64(st.NumTx))
+			state = append(state, springNormalizeStateCount(st.NumTx))
 		}
 	}
 
@@ -590,7 +620,7 @@ func (rthm *RelayCommitteeModule) springBuildState(related utils.Address) []floa
 	for back := 4; back >= 0; back-- {
 		for sid := uint64(0); sid < uint64(params.ShardNum); sid++ {
 			st := rthm.springGetStat(sid, back)
-			state = append(state, float64(st.CrossTx))
+			state = append(state, springNormalizeStateCount(st.CrossTx))
 		}
 	}
 
