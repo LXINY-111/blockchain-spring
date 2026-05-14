@@ -63,9 +63,9 @@ def calc_reward(num_tx: List[float], cross_tx: List[float], lam: float, beta: fl
     - 降低跨片交易比例
     - 保持负载均衡
 
-    这里做了稳定化处理：
-    r_cstr = 1 - cross / total
-    r_wlb = exp(-beta * normalized_abs_diff)
+    Paper formula:
+    r_cstr = total / (cross + eps)
+    r_wlb = exp(-beta * abs_diff)
     """
     total = float(sum(num_tx))
     cross = float(sum(cross_tx))
@@ -73,14 +73,12 @@ def calc_reward(num_tx: List[float], cross_tx: List[float], lam: float, beta: fl
     if total <= 0:
         return 0.0
 
-    r_cstr = 1.0 - cross / (total + 1e-8)
-    r_cstr = max(0.0, min(1.0, r_cstr))
+    r_cstr = total / (cross + 1e-6)
 
     avg = total / len(num_tx)
     abs_diff = sum(abs(x - avg) for x in num_tx)
-    normalized_abs_diff = abs_diff / (total + 1e-8)
 
-    r_wlb = math.exp(-beta * normalized_abs_diff)
+    r_wlb = math.exp(-beta * abs_diff)
 
     return lam * r_cstr + (1.0 - lam) * r_wlb
 

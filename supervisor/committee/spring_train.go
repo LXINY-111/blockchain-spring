@@ -29,9 +29,16 @@ type SpringFeedbackRewardRecord struct {
 	CrossRate              float64 `json:"cross_rate"`
 	RawLoadVariance        float64 `json:"raw_load_variance"`
 	NormalizedLoadVariance float64 `json:"normalized_load_variance"`
-	Reward                 float64 `json:"reward"`
+
+	// SPRING-style reward 分解项
+	RCSTR       float64 `json:"r_cstr"`
+	RWLB        float64 `json:"r_wlb"`
+	AbsLoadDiff float64 `json:"abs_load_diff"`
+
+	Reward float64 `json:"reward"`
 
 	Lambda float64 `json:"lambda"`
+	Beta   float64 `json:"beta"`
 }
 
 type SpringTrainAction struct {
@@ -42,6 +49,8 @@ type SpringTrainAction struct {
 	Action  int       `json:"action"`
 	LogProb float64   `json:"log_prob"`
 	Value   float64   `json:"value"`
+	Reward  float64   `json:"reward"`
+	Done    bool      `json:"done"`
 }
 
 type SpringTrainBatch struct {
@@ -63,6 +72,11 @@ type SpringOnlineUpdateInput struct {
 
 	CrossRate              float64 `json:"cross_rate"`
 	NormalizedLoadVariance float64 `json:"normalized_load_variance"`
+	RCSTR                  float64 `json:"r_cstr"`
+	RWLB                   float64 `json:"r_wlb"`
+	AbsLoadDiff            float64 `json:"abs_load_diff"`
+	Lambda                 float64 `json:"lambda"`
+	Beta                   float64 `json:"beta"`
 	TotalTx                int     `json:"total_tx"`
 	TotalInner             int     `json:"total_inner"`
 	TotalRelay1            int     `json:"total_relay1"`
@@ -81,8 +95,17 @@ func (rthm *RelayCommitteeModule) springBuildFeedbackRewardRecord(
 	epoch int,
 	shardStats map[uint64]SpringBlockStat,
 ) (SpringFeedbackRewardRecord, bool) {
-	lambda := 0.5
-	eps := 1e-8
+	lambda := params.SpringRewardLambda
+	if lambda < 0 || lambda > 1 {
+		lambda = 0.5
+	}
+
+	beta := params.SpringRewardBeta
+	if beta <= 0 {
+		beta = 0.1
+	}
+
+	eps := 1e-6
 
 	loads := make([]int, params.ShardNum)
 	inners := make([]int, params.ShardNum)
@@ -113,31 +136,44 @@ func (rthm *RelayCommitteeModule) springBuildFeedbackRewardRecord(
 		return SpringFeedbackRewardRecord{}, false
 	}
 
-	// 关键修复：
 	// 如果这个 epoch 只有 Relay2，没有 inner 和 Relay1，
-	// 说明它不是一个新的原始交易批次反馈，而是跨片第二阶段收尾。
-	// 这种 epoch 不能给 PPO 正奖励，否则会误导训练。
+	// 说明它只是跨片第二阶段收尾，不应该作为 PPO 放置动作的反馈。
 	decisionRelatedTx := totalInner + totalRelay1
 	if decisionRelatedTx == 0 {
 		return SpringFeedbackRewardRecord{}, false
 	}
 
+	// crossRate = 跨片交易比例。
+	// Relay1 表示唯一跨片交易数，Relay2 是第二阶段，不重复计入。
 	crossRate := float64(totalRelay1) / float64(decisionRelatedTx)
 
+	// Paper formula: r_cstr = sum(num_tx_i) / (sum(cross_tx_i) + eps).
+	rCSTR := float64(decisionRelatedTx) / (float64(totalRelay1) + eps)
+
+	// Paper workload-balance term: r_wlb = exp(-beta * abs_diff).
 	avgLoad := float64(totalTx) / float64(params.ShardNum)
+
+	absDiff := 0.0
 	rawVar := 0.0
+
 	for _, load := range loads {
 		diff := float64(load) - avgLoad
+		absDiff += math.Abs(diff)
 		rawVar += diff * diff
 	}
+
 	rawVar = rawVar / float64(params.ShardNum)
 
+	// 保留 normalizedLoadVariance 只是为了日志对比，
+	// 真实 reward 不再用它作为主项。
 	normVar := rawVar / (avgLoad*avgLoad + eps)
-
-	// 压缩到 [0,1)，避免方差太大导致 reward 爆炸。
 	normVar = normVar / (1.0 + normVar)
 
-	reward := lambda*(1.0-crossRate) - (1.0-lambda)*normVar
+	rWLB := math.Exp(-beta * absDiff)
+
+	// SPRING-style reward:
+	// r_t = λ * r_cstr + (1 - λ) * r_wlb
+	reward := lambda*rCSTR + (1.0-lambda)*rWLB
 
 	if math.IsNaN(reward) || math.IsInf(reward, 0) {
 		reward = 0.0
@@ -147,6 +183,12 @@ func (rthm *RelayCommitteeModule) springBuildFeedbackRewardRecord(
 	}
 	if math.IsNaN(normVar) || math.IsInf(normVar, 0) {
 		normVar = 0.0
+	}
+	if math.IsNaN(rCSTR) || math.IsInf(rCSTR, 0) {
+		rCSTR = 0.0
+	}
+	if math.IsNaN(rWLB) || math.IsInf(rWLB, 0) {
+		rWLB = 0.0
 	}
 
 	record := SpringFeedbackRewardRecord{
@@ -167,9 +209,15 @@ func (rthm *RelayCommitteeModule) springBuildFeedbackRewardRecord(
 		CrossRate:              crossRate,
 		RawLoadVariance:        rawVar,
 		NormalizedLoadVariance: normVar,
-		Reward:                 reward,
+
+		RCSTR:       rCSTR,
+		RWLB:        rWLB,
+		AbsLoadDiff: absDiff,
+
+		Reward: reward,
 
 		Lambda: lambda,
+		Beta:   beta,
 	}
 
 	return record, true
@@ -260,8 +308,17 @@ func (rthm *RelayCommitteeModule) springBuildOnlineUpdateInputLocked(
 		return SpringOnlineUpdateInput{}, false
 	}
 
-	nextStates := make([][]float64, 0, len(batch.Actions))
-	for _, action := range batch.Actions {
+	actions := make([]SpringTrainAction, len(batch.Actions))
+	copy(actions, batch.Actions)
+	for idx := range actions {
+		actions[idx].Reward = 0.0
+		actions[idx].Done = false
+	}
+	actions[len(actions)-1].Reward = rewardRecord.Reward
+	actions[len(actions)-1].Done = true
+
+	nextStates := make([][]float64, 0, len(actions))
+	for _, action := range actions {
 		nextState := rthm.springBuildState(utils.Address(action.Related))
 		nextStates = append(nextStates, nextState)
 	}
@@ -273,20 +330,26 @@ func (rthm *RelayCommitteeModule) springBuildOnlineUpdateInputLocked(
 		FeedbackEpoch: rewardRecord.Epoch,
 		Shards:        params.ShardNum,
 
-		Actions:    batch.Actions,
+		Actions:    actions,
 		Reward:     rewardRecord.Reward,
 		NextStates: nextStates,
 
-		// 第一版先把每个 TxBatch 当成一个独立训练片段。
-		// 后续真正连续在线训练时，再改成只有最后一批 done=true。
+		// The actions above form one placement trajectory for this TxBatch.
 		Done: true,
 
 		CrossRate:              rewardRecord.CrossRate,
 		NormalizedLoadVariance: rewardRecord.NormalizedLoadVariance,
-		TotalTx:                rewardRecord.TotalTx,
-		TotalInner:             rewardRecord.TotalInner,
-		TotalRelay1:            rewardRecord.TotalRelay1,
-		TotalRelay2:            rewardRecord.TotalRelay2,
+
+		RCSTR:       rewardRecord.RCSTR,
+		RWLB:        rewardRecord.RWLB,
+		AbsLoadDiff: rewardRecord.AbsLoadDiff,
+		Lambda:      rewardRecord.Lambda,
+		Beta:        rewardRecord.Beta,
+
+		TotalTx:     rewardRecord.TotalTx,
+		TotalInner:  rewardRecord.TotalInner,
+		TotalRelay1: rewardRecord.TotalRelay1,
+		TotalRelay2: rewardRecord.TotalRelay2,
 	}
 
 	return input, true

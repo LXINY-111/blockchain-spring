@@ -238,138 +238,108 @@ func (rthm *RelayCommitteeModule) springPreparePlacementPPOBatch(
 	txlist []*core.Transaction,
 	batchPlacement map[string]uint64,
 ) {
-	pending := make([]SpringBatchInferItem, 0)
-	seenInBatch := make(map[string]bool)
-
-	addPending := func(addr utils.Address, related utils.Address) {
-		key := string(addr)
-
-		if key == "" {
-			return
-		}
-
-		if _, ok := rthm.springAddrShard[key]; ok {
-			return
-		}
-
-		if seenInBatch[key] {
-			return
-		}
-
-		state := rthm.springBuildState(related)
-
-		pending = append(pending, SpringBatchInferItem{
-			Address: key,
-			Related: string(related),
-			State:   state,
-		})
-
-		seenInBatch[key] = true
-	}
-
+	// SPRING paper semantics: sender_pos is updated after each placement
+	// action within the current A-Shard block.
+	trainActions := make([]SpringTrainAction, 0)
 	for _, tx := range txlist {
-		addPending(tx.Sender, tx.Recipient)
-		addPending(tx.Recipient, tx.Sender)
-	}
-
-	if len(pending) == 0 {
-		return
-	}
-
-	results, inferCostUs, ok := rthm.springCallPythonBatch(pending)
-
-	resultByAddr := make(map[string]SpringBatchInferResult)
-	if ok {
-		for _, result := range results {
-			resultByAddr[result.Address] = result
+		if action, ok := rthm.springPlaceAddressPPOSequential(tx.Sender, tx.Recipient, batchPlacement); ok {
+			trainActions = append(trainActions, action)
+		}
+		if action, ok := rthm.springPlaceAddressPPOSequential(tx.Recipient, tx.Sender, batchPlacement); ok {
+			trainActions = append(trainActions, action)
 		}
 	}
 
-	perItemCostUs := inferCostUs
-	if len(pending) > 0 {
-		perItemCostUs = inferCostUs / int64(len(pending))
-	}
-
-	// 关键：一个 TxBatch 只维护一个 trainActions。
-	// for 循环里只 append，循环结束后统一入队一次。
-	trainActions := make([]SpringTrainAction, 0, len(pending))
-
-	for _, item := range pending {
-		addr := utils.Address(item.Address)
-		related := utils.Address(item.Related)
-
-		var sid uint64
-		source := ""
-		confidence := 0.0
-
-		result, hasResult := resultByAddr[item.Address]
-
-		if ok && hasResult && result.Shard >= 0 && result.Shard < params.ShardNum {
-			sid = uint64(result.Shard)
-			source = result.Source
-			confidence = result.Confidence
-
-			if source == "" {
-				source = "python_ppo"
-			}
-		} else {
-			sid = rthm.springChooseShard(addr, related)
-			source = "go_heuristic_batch_fallback"
-			confidence = 0.0
-		}
-
-		if _, exists := rthm.springAddrShard[item.Address]; exists {
-			continue
-		}
-
-		rthm.springAddrShard[item.Address] = sid
-		rthm.springShardLoad[sid]++
-		batchPlacement[item.Address] = sid
-
-		rthm.springAppendDecisionRecord(
-			result.BatchID,
-			item.Address,
-			item.Related,
-			sid,
-			source,
-			confidence,
-			result.LogProb,
-			result.Value,
-			item.State,
-			perItemCostUs,
-			len(pending),
-		)
-
-		if source == "python_ppo" && result.BatchID > 0 {
-			trainActions = append(trainActions, SpringTrainAction{
-				BatchID: result.BatchID,
-				Address: item.Address,
-				Related: item.Related,
-				State:   item.State,
-				Action:  int(sid),
-				LogProb: result.LogProb,
-				Value:   result.Value,
-			})
-		}
-
-		rthm.sl.Slog.Printf(
-			"[SPRING PPO BATCH PLACE] mode=%d addr=%s shard=%d related=%s source=%s confidence=%.6f totalPlaced=%d\n",
-			params.SpringMode,
-			item.Address,
-			sid,
-			item.Related,
-			source,
-			confidence,
-			len(rthm.springAddrShard),
-		)
-	}
-
-	// 关键修复：
-	// 必须放在 for 循环外面。
-	// 一个 PPO batch 只入队一次。
-	if len(trainActions) > 0 {
+	if params.SpringOnlineTrain == 1 && len(trainActions) > 0 {
 		rthm.springEnqueueTrainActionsLocked(trainActions[0].BatchID, trainActions)
 	}
+}
+
+func (rthm *RelayCommitteeModule) springPlaceAddressPPOSequential(
+	addr utils.Address,
+	related utils.Address,
+	batchPlacement map[string]uint64,
+) (SpringTrainAction, bool) {
+	key := string(addr)
+	if key == "" {
+		return SpringTrainAction{}, false
+	}
+	if _, ok := rthm.springAddrShard[key]; ok {
+		return SpringTrainAction{}, false
+	}
+
+	state := rthm.springBuildState(related)
+	item := SpringBatchInferItem{
+		Address: key,
+		Related: string(related),
+		State:   state,
+	}
+
+	results, inferCostUs, ok := rthm.springCallPythonBatch([]SpringBatchInferItem{item})
+
+	result := SpringBatchInferResult{}
+	if ok && len(results) == 1 {
+		result = results[0]
+	}
+
+	var sid uint64
+	source := ""
+	confidence := 0.0
+
+	if ok && result.Shard >= 0 && result.Shard < params.ShardNum {
+		sid = uint64(result.Shard)
+		source = result.Source
+		confidence = result.Confidence
+		if source == "" {
+			source = "python_ppo"
+		}
+	} else {
+		sid = rthm.springChooseShard(addr, related)
+		source = "go_heuristic_sequential_fallback"
+	}
+
+	rthm.springAddrShard[key] = sid
+	rthm.springShardLoad[sid]++
+	batchPlacement[key] = sid
+
+	rthm.springAppendDecisionRecord(
+		result.BatchID,
+		key,
+		item.Related,
+		sid,
+		source,
+		confidence,
+		result.LogProb,
+		result.Value,
+		state,
+		inferCostUs,
+		1,
+	)
+
+	rthm.sl.Slog.Printf(
+		"[SPRING PPO SEQ PLACE] mode=%d addr=%s shard=%d related=%s source=%s confidence=%.6f totalPlaced=%d\n",
+		params.SpringMode,
+		key,
+		sid,
+		item.Related,
+		source,
+		confidence,
+		len(rthm.springAddrShard),
+	)
+
+	if source != "python_ppo" || result.BatchID == 0 {
+		return SpringTrainAction{}, false
+	}
+
+	return SpringTrainAction{
+		BatchID: result.BatchID,
+		Address: key,
+		Related: item.Related,
+		State:   state,
+		Action:  int(sid),
+		LogProb: result.LogProb,
+		Value:   result.Value,
+	}, true
 }
 
 func (rthm *RelayCommitteeModule) txSending(txlist []*core.Transaction) {
@@ -537,25 +507,40 @@ func (rthm *RelayCommitteeModule) HandleBlockInfo(b *message.BlockInfoMsg) {
 			rthm.springAppendFeedbackRecord(record)
 
 			rthm.sl.Slog.Printf(
-				"[SPRING ONLINE REWARD] epoch=%d total=%d inner=%d relay1=%d relay2=%d crossRate=%.6f normVar=%.6f reward=%.6f loads=%v\n",
+				"[SPRING ONLINE REWARD] epoch=%d total=%d inner=%d relay1=%d relay2=%d crossRate=%.6f rCSTR=%.6f rWLB=%.6f absDiff=%.6f normVar=%.6f reward=%.6f lambda=%.3f beta=%.3f loads=%v\n",
 				record.Epoch,
 				record.TotalTx,
 				record.TotalInner,
 				record.TotalRelay1,
 				record.TotalRelay2,
 				record.CrossRate,
+				record.RCSTR,
+				record.RWLB,
+				record.AbsLoadDiff,
 				record.NormalizedLoadVariance,
 				record.Reward,
+				record.Lambda,
+				record.Beta,
 				record.Loads,
 			)
 
-			onlineInput, updateOk := rthm.springBuildOnlineUpdateInputLocked(record)
-			if updateOk {
-				rthm.springWriteOnlineUpdateInput(onlineInput)
+			if params.SpringMode == 2 && params.SpringOnlineTrain == 1 {
+				onlineInput, updateOk := rthm.springBuildOnlineUpdateInputLocked(record)
+				if updateOk {
+					rthm.springWriteOnlineUpdateInput(onlineInput)
 
-				// 第四步：生成 online_update 文件后，立即调用 Python 更新 PPO。
-				// 这里不做显式负载保护，也不改 PPO 动作，只用 reward 训练模型。
-				rthm.springCallPythonOnlineUpdate(onlineInput)
+					// 在线训练阶段：生成 online_update 文件后，调用 Python 更新 PPO。
+					// 不做显式负载保护，不改 PPO 动作，只用 reward 训练模型。
+					rthm.springCallPythonOnlineUpdate(onlineInput)
+				}
+			} else if params.SpringMode == 2 && params.SpringOnlineTrain == 0 {
+				rthm.sl.Slog.Printf(
+					"[SPRING ONLINE UPDATE SKIP] epoch=%d reason=SpringOnlineTrain_disabled reward=%.6f crossRate=%.6f normVar=%.6f\n",
+					record.Epoch,
+					record.Reward,
+					record.CrossRate,
+					record.NormalizedLoadVariance,
+				)
 			}
 		} else {
 			rthm.sl.Slog.Printf(

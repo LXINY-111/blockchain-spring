@@ -39,6 +39,26 @@ var (
 	// 2 = SPRING-PPO
 	SpringMode = 2
 
+	// SpringOnlineTrain:
+	// 1 = PPO 在线训练：采样动作 + 生成 online_update + 更新模型
+	// 0 = PPO 验证模式：不采样 + 不更新模型
+	SpringOnlineTrain = 0
+
+	// SpringEvalSample:
+	// 1 = 验证模式下也使用采样，但不更新模型
+	// 0 = 验证模式下使用最大概率动作
+	SpringEvalSample = 0
+
+	// SpringRewardLambda:
+	// SPRING reward 中跨片率奖励和负载均衡奖励的权重。
+	// 论文默认 λ = 0.5。
+	SpringRewardLambda = 0.5
+
+	// SpringRewardBeta:
+	// SPRING reward 中负载均衡项 r_wlb = exp(-β * abs_diff) 的衰减系数。
+	// 论文默认 β = 0.1。
+	SpringRewardBeta = 0.1
+
 	ExpDataRootDir     = "expTest"                     // The root dir where the experimental data should locate.
 	DataWrite_path     = ExpDataRootDir + "/result/"   // Measurement data result output path
 	LogWrite_path      = ExpDataRootDir + "/log"       // Log output path
@@ -62,6 +82,13 @@ type globalConfig struct {
 	ConsensusMethod int `json:"ConsensusMethod"`
 
 	SpringMode int `json:"SpringMode"`
+
+	SpringOnlineTrain int `json:"SpringOnlineTrain"`
+
+	SpringRewardLambda float64 `json:"SpringRewardLambda"`
+	SpringRewardBeta   float64 `json:"SpringRewardBeta"`
+
+	SpringEvalSample int `json:"SpringEvalSample"`
 
 	PbftViewChangeTimeOut int `json:"PbftViewChangeTimeOut"`
 
@@ -108,6 +135,18 @@ func ReadConfigFile() {
 
 	SpringMode = config.SpringMode
 
+	SpringOnlineTrain = config.SpringOnlineTrain
+
+	SpringRewardLambda = config.SpringRewardLambda
+	if SpringRewardLambda < 0 || SpringRewardLambda > 1 {
+		SpringRewardLambda = 0.5
+	}
+
+	SpringRewardBeta = config.SpringRewardBeta
+	if SpringRewardBeta <= 0 {
+		SpringRewardBeta = 0.1
+	}
+
 	PbftViewChangeTimeOut = config.PbftViewChangeTimeOut
 
 	// data file params
@@ -125,6 +164,8 @@ func ReadConfigFile() {
 	InjectSpeed = config.InjectSpeed
 	TotalDataSize = config.TotalDataSize
 	TxBatchSize = config.TxBatchSize
+
+	SpringEvalSample = config.SpringEvalSample
 
 	BrokerNum = config.BrokerNum
 	RelayWithMerkleProof = config.RelayWithMerkleProof

@@ -127,15 +127,15 @@ def build_buffer(data: Dict[str, Any]) -> Tuple[RolloutBuffer, Dict[str, Any]]:
             continue
 
         clean_state = [safe_float(x, 0.0) for x in state]
+        item_reward = safe_float(item.get("reward", reward), reward)
+        item_done = bool(item.get("done", done))
 
-        # 当前第一版：同一个 TxBatch 内的所有动作共享同一个真实区块 reward。
-        # 每个动作都视为一个独立样本，所以 done 对每条样本都使用 input 的 done。
         buffer.add(
             state=clean_state,
             action=action,
             log_prob=log_prob,
-            reward=reward,
-            done=done,
+            reward=item_reward,
+            done=item_done,
             value=value,
         )
 

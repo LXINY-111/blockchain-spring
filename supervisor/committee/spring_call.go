@@ -222,9 +222,14 @@ func (rthm *RelayCommitteeModule) springCallPythonBatch(items []SpringBatchInfer
 		outputPath,
 	}
 
-	// 当前阶段是 SPRING-Lite 在线训练阶段。
-	// 训练阶段使用 --sample，让 PPO 按策略概率采样动作，避免每批都取最大概率 shard。
-	if params.SpringMode == 2 {
+	// SpringOnlineTrain = 1：在线训练阶段，使用 --sample，让 PPO 按策略概率采样。
+	// SpringOnlineTrain = 0：验证阶段，不采样，使用最大概率动作。
+	// 在线训练阶段：采样 + 更新模型。
+	// 验证采样阶段：采样但不更新模型，用于观察概率策略本身效果。
+	//SpringOnlineTrain=0, SpringEvalSample=1：采样，但 committee_relay.go 里不会调用 update_online.py。
+	//SpringOnlineTrain=0, SpringEvalSample=0：不采样，使用最大概率动作
+	if params.SpringMode == 2 &&
+		(params.SpringOnlineTrain == 1 || params.SpringEvalSample == 1) {
 		args = append(args, "--sample")
 	}
 
