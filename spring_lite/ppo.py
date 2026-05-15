@@ -98,32 +98,77 @@ class PPOAgent:
 
     def update(self, buffer: RolloutBuffer):
         if len(buffer) == 0:
-            return {}
+            return {"num_samples": 0, "message": "empty_buffer"}
 
-        states = torch.tensor(np.asarray(buffer.states), dtype=torch.float32, device=self.device)
-        actions = torch.tensor(buffer.actions, dtype=torch.long, device=self.device)
-        old_log_probs = torch.tensor(buffer.log_probs, dtype=torch.float32, device=self.device)
+        states = torch.tensor(
+            np.asarray(buffer.states),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        actions = torch.tensor(
+            buffer.actions,
+            dtype=torch.long,
+            device=self.device,
+        )
+        old_log_probs = torch.tensor(
+            buffer.log_probs,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
+        # 关键：从后往前计算 discounted return，实现 block reward 向前传播。
+        # 如果某个 action.done=True，说明一条 TxBatch trajectory 结束。
         returns_np = self._discounted_returns(buffer.rewards, buffer.dones)
-        returns = torch.tensor(returns_np, dtype=torch.float32, device=self.device)
+        returns = torch.tensor(
+            returns_np,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
-        old_values = torch.tensor(buffer.values, dtype=torch.float32, device=self.device)
-        advantages = returns - old_values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        old_values = torch.tensor(
+            buffer.values,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        # advantage = target_value - old_value
+        advantages_raw = returns - old_values
+
+        adv_mean_before_norm = float(advantages_raw.mean().item())
+        adv_std_before_norm = float(advantages_raw.std().item()) if len(buffer) > 1 else 0.0
+        return_mean = float(returns.mean().item())
+        return_std = float(returns.std().item()) if len(buffer) > 1 else 0.0
+
+        if len(buffer) > 1:
+            advantages = (advantages_raw - advantages_raw.mean()) / (
+                advantages_raw.std() + 1e-8
+            )
+        else:
+            advantages = advantages_raw
 
         last_loss = {}
+
         for _ in range(self.ppo_epochs):
             log_probs, entropy, values = self.net.evaluate_actions(states, actions)
 
             ratio = torch.exp(log_probs - old_log_probs)
+
             unclipped = ratio * advantages
-            clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
+            clipped = torch.clamp(
+                ratio,
+                1.0 - self.clip_eps,
+                1.0 + self.clip_eps,
+            ) * advantages
 
             policy_loss = -torch.min(unclipped, clipped).mean()
             value_loss = F.mse_loss(values, returns)
             entropy_loss = -entropy.mean()
 
-            loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+            loss = (
+                policy_loss
+                + self.value_coef * value_loss
+                + self.entropy_coef * entropy_loss
+            )
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -135,10 +180,17 @@ class PPOAgent:
                 "policy_loss": float(policy_loss.item()),
                 "value_loss": float(value_loss.item()),
                 "entropy": float(entropy.mean().item()),
+                "num_samples": len(buffer),
+                "num_trajectories": int(sum(1 for d in buffer.dones if d)),
+                "return_mean": return_mean,
+                "return_std": return_std,
+                "adv_mean_before_norm": adv_mean_before_norm,
+                "adv_std_before_norm": adv_std_before_norm,
+                "reward_sum": float(sum(buffer.rewards)),
             }
 
         return last_loss
-
+    
     def save(self, path, extra=None):
         payload = {
             "state_dim": self.state_dim,

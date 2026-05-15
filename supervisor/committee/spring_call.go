@@ -184,83 +184,62 @@ func (rthm *RelayCommitteeModule) springCallPythonBatch(items []SpringBatchInfer
 
 	reqID := atomic.AddUint64(&rthm.springActionSeq, 1)
 
-	inputPath := filepath.Join("spring_io", fmt.Sprintf("batch_state_%d.json", reqID))
-	outputPath := filepath.Join("spring_io", fmt.Sprintf("batch_action_%d.json", reqID))
+	sampleMode := params.SpringMode == 2 &&
+		(params.SpringOnlineTrain == 1 || params.SpringEvalSample == 1)
 
-	input := SpringBatchInferInput{
-		Shards: params.ShardNum,
-		Items:  items,
-	}
+	// 默认不再写 batch_state_x.json / batch_action_x.json。
+	// 这些只是调试推理输入输出用的，不是 PPO 训练必须文件。
+	// 如果以后临时想重新打开，可以在 PowerShell 里设置：
+	// $env:SPRING_DUMP_BATCH_IO="1"
+	dumpBatchIO := os.Getenv("SPRING_DUMP_BATCH_IO") == "1"
 
-	inputBytes, err := json.Marshal(input)
-	if err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO BATCH] marshal input failed: %v\n", err)
-		return nil, 0, false
-	}
+	var outputPath string
 
-	if err := os.WriteFile(inputPath, inputBytes, 0644); err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO BATCH] write input failed: %v\n", err)
-		return nil, 0, false
-	}
+	if dumpBatchIO {
+		inputPath := filepath.Join("spring_io", fmt.Sprintf("batch_state_%d.json", reqID))
+		outputPath = filepath.Join("spring_io", fmt.Sprintf("batch_action_%d.json", reqID))
 
-	pythonCmd := os.Getenv("SPRING_PYTHON")
-	if pythonCmd == "" {
-		if runtime.GOOS == "windows" {
-			pythonCmd = "python"
-		} else {
-			pythonCmd = "python3"
+		input := SpringBatchInferInput{
+			Shards: params.ShardNum,
+			Items:  items,
+		}
+
+		inputBytes, err := json.Marshal(input)
+		if err != nil {
+			rthm.sl.Slog.Printf("[SPRING PPO BATCH] marshal input failed: %v\n", err)
+			return nil, 0, false
+		}
+
+		if err := os.WriteFile(inputPath, inputBytes, 0644); err != nil {
+			rthm.sl.Slog.Printf("[SPRING PPO BATCH] write input failed: %v\n", err)
+			return nil, 0, false
 		}
 	}
 
+	modelPath := filepath.Join("spring_lite", "checkpoints", "spring_ppo.pt")
+
 	start := time.Now()
 
-	args := []string{
-		filepath.Join("spring_lite", "infer_batch.py"),
-		"--state",
-		inputPath,
-		"--out",
-		outputPath,
-	}
+	resp, err := springCallInferServer(springInferServerRequest{
+		RequestID: reqID,
+		Shards:    params.ShardNum,
+		Sample:    sampleMode,
+		Model:     modelPath,
+		Items:     items,
+	})
 
-	// SpringOnlineTrain = 1：在线训练阶段，使用 --sample，让 PPO 按策略概率采样。
-	// SpringOnlineTrain = 0：验证阶段，不采样，使用最大概率动作。
-	// 在线训练阶段：采样 + 更新模型。
-	// 验证采样阶段：采样但不更新模型，用于观察概率策略本身效果。
-	//SpringOnlineTrain=0, SpringEvalSample=1：采样，但 committee_relay.go 里不会调用 update_online.py。
-	//SpringOnlineTrain=0, SpringEvalSample=0：不采样，使用最大概率动作
-	if params.SpringMode == 2 &&
-		(params.SpringOnlineTrain == 1 || params.SpringEvalSample == 1) {
-		args = append(args, "--sample")
-	}
-
-	cmd := exec.Command(pythonCmd, args...)
-
-	out, err := cmd.CombinedOutput()
 	inferCostUs := time.Since(start).Microseconds()
 
 	if err != nil {
 		rthm.sl.Slog.Printf(
-			"[SPRING PPO BATCH] python infer failed: %v, output=%s\n",
-			err,
-			string(out),
+			"[SPRING PPO BATCH] infer_server failed batch_id=%d items=%d sample=%v cost_us=%d err=%v\n",
+			reqID, len(items), sampleMode, inferCostUs, err,
 		)
 		return nil, inferCostUs, false
 	}
 
-	outputBytes, err := os.ReadFile(outputPath)
-	if err != nil {
-		rthm.sl.Slog.Printf("[SPRING PPO BATCH] read output failed: %v\n", err)
-		return nil, inferCostUs, false
-	}
-
-	var output SpringBatchInferOutput
-	if err := json.Unmarshal(outputBytes, &output); err != nil {
-		rthm.sl.Slog.Printf(
-			"[SPRING PPO BATCH] unmarshal output failed: %v, raw=%s\n",
-			err,
-			string(outputBytes),
-		)
-		return nil, inferCostUs, false
+	output := SpringBatchInferOutput{
+		Items: resp.Items,
 	}
 
 	for i := range output.Items {
@@ -269,12 +248,16 @@ func (rthm *RelayCommitteeModule) springCallPythonBatch(items []SpringBatchInfer
 		}
 	}
 
+	if dumpBatchIO {
+		outputBytes, err := json.Marshal(output)
+		if err == nil {
+			_ = os.WriteFile(outputPath, outputBytes, 0644)
+		}
+	}
+
 	rthm.sl.Slog.Printf(
-		"[SPRING PPO BATCH] batch_id=%d items=%d results=%d cost_us=%d\n",
-		reqID,
-		len(items),
-		len(output.Items),
-		inferCostUs,
+		"[SPRING PPO BATCH] batch_id=%d items=%d results=%d sample=%v cost_us=%d server=1 dump=%v\n",
+		reqID, len(items), len(output.Items), sampleMode, inferCostUs, dumpBatchIO,
 	)
 
 	return output.Items, inferCostUs, true

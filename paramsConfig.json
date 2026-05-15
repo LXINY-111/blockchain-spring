@@ -21,14 +21,14 @@
   "UseBlocksizeInBytes": 0,
 
   "InjectSpeed": 100,
-  "TotalDataSize": 2000,
-  "TxBatchSize": 100,
+  "TotalDataSize": 10000,
+  "TxBatchSize": 500,
 
   "BrokerNum": 10,
   "RelayWithMerkleProof": 0,
   
   "DatasetFile": "./selectedTxs_300K.csv",
-  "ReconfigTimeGap": 100,
+  "ReconfigTimeGap": 500,
 
   "Delay": -1,
   "JitterRange": -1,

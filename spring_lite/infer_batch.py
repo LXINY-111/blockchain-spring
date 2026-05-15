@@ -70,26 +70,68 @@ def safe_heuristic(item: Dict[str, Any], shards: int, reason: str) -> Dict[str, 
 def load_agent(shards: int, model_path: Path) -> Tuple[Optional[PPOAgent], str]:
     expected_dim = state_dim(shards)
 
-    if not model_path.exists():
-        return None, "no_model"
+    def create_fresh_agent() -> PPOAgent:
+        return PPOAgent(
+            state_dim=expected_dim,
+            action_dim=shards,
+            hidden_dim=HIDDEN_DIM,
+            device="cpu",
+        )
 
-    agent = PPOAgent(
-        state_dim=expected_dim,
-        action_dim=shards,
-        hidden_dim=HIDDEN_DIM,
-        device="cpu",
-    )
+    agent = create_fresh_agent()
+
+    # 关键修正：
+    # 如果模型不存在，不再退回 heuristic。
+    # 否则你删除 spring_ppo.pt 后，Go 侧会收到 python_heuristic_no_model，
+    # source != python_ppo，动作不会进入在线训练队列，模型永远无法被训练出来。
+    if not model_path.exists():
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        agent.save(
+            model_path,
+            extra={
+                "model_source": "init_by_infer_batch",
+                "online_update_count": 0,
+            },
+        )
+        agent.net.eval()
+        return agent, "python_ppo"
 
     try:
         payload = agent.load(model_path)
-    except Exception as e:
-        return None, f"load_failed_{type(e).__name__}"
+    except Exception:
+        # 模型损坏时，直接重置成一个新的 PPO 模型，保证在线训练链路不中断。
+        agent = create_fresh_agent()
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        agent.save(
+            model_path,
+            extra={
+                "model_source": "reset_load_failed_by_infer_batch",
+                "online_update_count": 0,
+            },
+        )
+        agent.net.eval()
+        return agent, "python_ppo"
 
     ckpt_state_dim = int(payload.get("state_dim", -1))
     ckpt_action_dim = int(payload.get("action_dim", -1))
 
     if ckpt_state_dim != expected_dim or ckpt_action_dim != shards:
-        return None, "model_dim_mismatch"
+        # 分片数或状态维度变化时，旧模型不能继续用，直接重置。
+        agent = create_fresh_agent()
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        agent.save(
+            model_path,
+            extra={
+                "model_source": "reset_dim_mismatch_by_infer_batch",
+                "online_update_count": 0,
+                "old_state_dim": ckpt_state_dim,
+                "old_action_dim": ckpt_action_dim,
+                "new_state_dim": expected_dim,
+                "new_action_dim": shards,
+            },
+        )
+        agent.net.eval()
+        return agent, "python_ppo"
 
     agent.net.eval()
     return agent, "python_ppo"

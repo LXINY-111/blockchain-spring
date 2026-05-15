@@ -155,7 +155,17 @@ func (rthm *RelayCommitteeModule) springBuildFeedbackRewardRecord(
 	crossRate := float64(totalRelay1) / float64(decisionRelatedTx)
 
 	// Paper formula: r_cstr = sum(num_tx_i) / (sum(cross_tx_i) + eps).
-	rCSTR := float64(decisionRelatedTx) / (float64(totalRelay1) + eps)
+	// 但在 SPRING-Lite 小规模实验中，如果 cross=0，原式会非常大，导致 reward 爆炸。
+	// 所以这里使用裁剪版：保留“跨片越少越好”的方向，但限制最大值。
+	rCSTRRaw := float64(decisionRelatedTx) / (float64(totalRelay1) + eps)
+	rCSTRCap := 10.0
+	rCSTR := rCSTRRaw
+	if rCSTR > rCSTRCap {
+		rCSTR = rCSTRCap
+	}
+	if rCSTR < 0 {
+		rCSTR = 0
+	}
 
 	// Paper workload-balance term: r_wlb = exp(-beta * abs_diff).
 	avgLoad := float64(totalTx) / float64(params.ShardNum)

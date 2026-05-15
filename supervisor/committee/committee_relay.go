@@ -264,14 +264,34 @@ func (rthm *RelayCommitteeModule) springPlaceAddressPPOSequential(
 	if key == "" {
 		return SpringTrainAction{}, false
 	}
+
+	// 已经放置过的地址，不再重复决策。
 	if _, ok := rthm.springAddrShard[key]; ok {
 		return SpringTrainAction{}, false
 	}
 
+	relatedKey := string(related)
+
+	// related_in_current_batch：
+	// 表示 related 地址是否是在当前 TxBatch 内已经被前面的 sequential 决策放置过。
+	relatedInCurrentBatch := false
+	if relatedKey != "" {
+		if _, ok := batchPlacement[relatedKey]; ok {
+			relatedInCurrentBatch = true
+		}
+	}
+
+	// 构造 PPO 状态。
+	// 当前代码里的 springBuildState 已经会把最近 5 个块的 totalTx/crossTx 归一化到 0~1。
 	state := rthm.springBuildState(related)
+
+	// 从 state 的 sender_pos 区域反推 related 是否已知、在哪个 shard。
+	// 这样可以保证诊断字段和 PPO 实际看到的 state 一致。
+	relatedKnown, relatedShard := springExtractRelatedShardFromState(state)
+
 	item := SpringBatchInferItem{
 		Address: key,
-		Related: string(related),
+		Related: relatedKey,
 		State:   state,
 	}
 
@@ -298,9 +318,14 @@ func (rthm *RelayCommitteeModule) springPlaceAddressPPOSequential(
 		source = "go_heuristic_sequential_fallback"
 	}
 
+	// sequential 语义的关键：
+	// 当前地址决策后立即落表，后续地址构造 state 时能看到它。
 	rthm.springAddrShard[key] = sid
 	rthm.springShardLoad[sid]++
 	batchPlacement[key] = sid
+
+	chosenShard := int(sid)
+	sameAsRelated := relatedKnown && chosenShard == relatedShard
 
 	rthm.springAppendDecisionRecord(
 		result.BatchID,
@@ -317,28 +342,40 @@ func (rthm *RelayCommitteeModule) springPlaceAddressPPOSequential(
 	)
 
 	rthm.sl.Slog.Printf(
-		"[SPRING PPO SEQ PLACE] mode=%d addr=%s shard=%d related=%s source=%s confidence=%.6f totalPlaced=%d\n",
+		"[SPRING PPO SEQ PLACE] mode=%d addr=%s shard=%d related=%s source=%s confidence=%.6f related_known=%v related_shard=%d chosen_shard=%d same_as_related=%v related_in_current_batch=%v totalPlaced=%d\n",
 		params.SpringMode,
 		key,
 		sid,
 		item.Related,
 		source,
 		confidence,
+		relatedKnown,
+		relatedShard,
+		chosenShard,
+		sameAsRelated,
+		relatedInCurrentBatch,
 		len(rthm.springAddrShard),
 	)
 
+	// 只有真正由 PPO 网络产生的动作，才进入在线训练。
+	// heuristic fallback 只是保证系统能跑，不作为 PPO 经验。
 	if source != "python_ppo" || result.BatchID == 0 {
 		return SpringTrainAction{}, false
 	}
 
 	return SpringTrainAction{
-		BatchID: result.BatchID,
-		Address: key,
-		Related: item.Related,
-		State:   state,
-		Action:  int(sid),
-		LogProb: result.LogProb,
-		Value:   result.Value,
+		BatchID:               result.BatchID,
+		Address:               key,
+		Related:               item.Related,
+		State:                 state,
+		Action:                chosenShard,
+		LogProb:               result.LogProb,
+		Value:                 result.Value,
+		RelatedKnown:          relatedKnown,
+		RelatedShard:          relatedShard,
+		ChosenShard:           chosenShard,
+		SameAsRelated:         sameAsRelated,
+		RelatedInCurrentBatch: relatedInCurrentBatch,
 	}, true
 }
 
